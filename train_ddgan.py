@@ -209,7 +209,7 @@ def dict2namespace(config):
 
 #%%
 def train(rank, gpu, args):
-    from score_sde.models.discriminator import Discriminator_small, Discriminator_large
+    from score_sde.models.discriminator import Discriminator_small, Discriminator_large, Discriminator_small_modulate
     from score_sde.models.ncsnpp_generator_adagn import NCSNpp
     from ddim.models.diffusion import Model as DDIM
     from EMA import EMA
@@ -281,7 +281,7 @@ def train(rank, gpu, args):
 
 
     if args.dataset == 'cifar10' or args.dataset == 'stackmnist':    
-        netD = Discriminator_small(nc = 2*args.num_channels, ngf = args.ngf,
+        netD = Discriminator_small_modulate(nc = 2*args.num_channels, ngf = args.ngf,
                                t_emb_dim = args.t_emb_dim,
                                act=nn.LeakyReLU(0.2)).to(device)
     else:
