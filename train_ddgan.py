@@ -7,6 +7,8 @@
 
 
 import argparse
+from copy import deepcopy
+import itertools
 import torch
 import numpy as np
 
@@ -148,6 +150,25 @@ def q_sample(coeff, x_start, t, netTrg, *, noise=None):
     eps_trg = netTrg(x_t, t)
     x_0 = (x_t - (1 - a).sqrt() * eps_trg) / a.sqrt()
     
+    return x_0, a, x_t
+
+def q_sample_st(coeff, x_start, t, netTrg, a_next, noised_next, *, noise=None):
+    """
+    Diffuse the data (t == 0 means diffused for t step)
+    """
+    if noise is None:
+      noise = torch.randn_like(x_start)
+    
+    a = coeff.compute_alpha(t)
+      
+    # x_t = a.sqrt() * x_start + (1 - a).sqrt() * noise
+    a_ts = (a / a_next)
+    var_ts = ((1-a) - (1-a_next) * a_ts)
+    x_t = a_ts.sqrt() * noised_next + var_ts.sqrt() * noise
+
+    eps_trg = netTrg(x_t, t)
+    x_0 = (x_t - (1 - a).sqrt() * eps_trg) / a.sqrt()
+    
     return x_0
 
 def q_sample_pairs(coeff, x_start, t, netTrg):
@@ -158,9 +179,9 @@ def q_sample_pairs(coeff, x_start, t, netTrg):
     :return: x_t, x_{t+1}
     """
     # noise = torch.randn_like(x_start)
-    x_t = q_sample(coeff, x_start, t, netTrg)
+    x_t, a, x_noised = q_sample(coeff, x_start, t, netTrg)
     prev_t = (t + coeff.step_size).clip(max=coeff.num_timesteps-1)
-    x_t_plus_one = q_sample(coeff, x_start, prev_t, netTrg)
+    x_t_plus_one = q_sample_st(coeff, x_start, prev_t, netTrg, a, x_noised)
     # x_t_plus_one = extract(coeff.a_s, prev_t, x_start.shape) * x_t + \
     #                extract(coeff.sigmas, prev_t, x_start.shape) * noise
     
@@ -179,18 +200,18 @@ def sample_posterior(coeff, x_0, x_t, t, next_t, **kwargs):
     
     return xt_next
 
-def sample_from_model(coeff, generator, n_time, x_init, T, opt, netTrg):
+def sample_from_model(coeff, generator, n_time, x_init, T, opt, netTrg, netEnc, real_data):
     x = x_init
     with torch.no_grad():
-
         t = torch.full((x.size(0),), 999, dtype=torch.int64).to(x.device)
         x = netTrg(x, t)
         for i in reversed(range(1, n_time)):
             t = torch.full((x.size(0),), i * coeff.step_size, dtype=torch.int64).to(x.device)
+            x_enc = netEnc(real_data, t)
           
             # t_time = t
             # next_time = (t - coeff.step_size).clip(min=0)
-            latent_z = torch.randn(x.size(0), opt.nz, device=x.device)
+            latent_z = torch.randn(x.size(0), opt.nz, device=x.device) + x_enc
             x = generator(x, t, latent_z)
             # x_new = sample_posterior(coeff, x_0, x, t)
             # x = x_new.detach()
@@ -212,11 +233,14 @@ def train(rank, gpu, args):
     from score_sde.models.discriminator import Discriminator_small, Discriminator_large, Discriminator_small_modulate
     from score_sde.models.ncsnpp_generator_adagn import NCSNpp
     from ddim.models.diffusion import Model as DDIM
+    from ddim.models.diffusion import Encoder
+
     from EMA import EMA
 
     torch.manual_seed(args.seed + rank)
     torch.cuda.manual_seed(args.seed + rank)
     torch.cuda.manual_seed_all(args.seed + rank)
+    # torch.autograd.set_detect_anomaly(True)
     device = torch.device('cuda:{}'.format(gpu))
     
     batch_size = args.batch_size
@@ -279,9 +303,14 @@ def train(rank, gpu, args):
     netTrg = DDIM(ddim_config).to(device)
     netTrg.load_state_dict(torch.load(ddim_config.model.pretrained))
 
+    enc_config = deepcopy(ddim_config)
+    enc_config.model.out_ch = args.nz
+    enc_config.model.zero_out = True
+    netEnc = Encoder(enc_config).to(device)
+
 
     if args.dataset == 'cifar10' or args.dataset == 'stackmnist':    
-        netD = Discriminator_small_modulate(nc = 2*args.num_channels, ngf = args.ngf,
+        netD = Discriminator_small(nc = 2*args.num_channels, ngf = args.ngf,
                                t_emb_dim = args.t_emb_dim,
                                act=nn.LeakyReLU(0.2)).to(device)
     else:
@@ -293,10 +322,10 @@ def train(rank, gpu, args):
     broadcast_params(netG.parameters())
     broadcast_params(netD.parameters())
     broadcast_params(netTrg.parameters())
+    broadcast_params(netEnc.parameters())
     
     optimizerD = optim.Adam(netD.parameters(), lr=args.lr_d, betas = (args.beta1, args.beta2))
-    
-    optimizerG = optim.Adam(netG.parameters(), lr=args.lr_g, betas = (args.beta1, args.beta2))
+    optimizerG = optim.Adam(itertools.chain(netG.parameters(), netEnc.parameters()), lr=args.lr_g, betas = (args.beta1, args.beta2))
     
     if args.use_ema:
         optimizerG = EMA(optimizerG, ema_decay=args.ema_decay)
@@ -307,6 +336,7 @@ def train(rank, gpu, args):
     #ddp
     netG = nn.parallel.DistributedDataParallel(netG, device_ids=[gpu])
     netD = nn.parallel.DistributedDataParallel(netD, device_ids=[gpu])
+    netEnc = nn.parallel.DistributedDataParallel(netEnc, device_ids=[gpu])
     netTrg = nn.parallel.DistributedDataParallel(netTrg, device_ids=[gpu])
     netTrg.eval()
 
@@ -330,6 +360,7 @@ def train(rank, gpu, args):
         init_epoch = checkpoint['epoch']
         epoch = init_epoch
         netG.load_state_dict(checkpoint['netG_dict'])
+        netEnc.load_state_dict(checkpoint['netEnc_dict'])
         # load G
         
         optimizerG.load_state_dict(checkpoint['optimizerG'])
@@ -351,7 +382,6 @@ def train(rank, gpu, args):
         for iteration, (x, y) in enumerate(data_loader):
             for p in netD.parameters():  
                 p.requires_grad = True  
-        
             
             netD.zero_grad()
             
@@ -363,6 +393,7 @@ def train(rank, gpu, args):
             
             x_t_D, x_tp1_D = q_sample_pairs(coeff, real_data, t, netTrg)
             x_t_D.requires_grad = True
+            x_enc = netEnc(real_data, t)
             
     
             # train with real
@@ -391,7 +422,7 @@ def train(rank, gpu, args):
                             outputs=D_real.sum(), inputs=x_t_D, create_graph=True
                             )[0]
                     grad_penalty = (
-                                grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2
+                                grad_real.reshape(grad_real.size(0), -1).norm(2, dim=1) ** 2
                                 ).mean()
                 
                 
@@ -399,7 +430,7 @@ def train(rank, gpu, args):
                     grad_penalty.backward()
 
             # train with fake
-            latent_z = torch.randn(batch_size, nz, device=device)
+            latent_z = torch.randn(batch_size, nz, device=device) + x_enc
             
             x_t_D_predict = netG(x_tp1_D, t, latent_z)
             
@@ -418,14 +449,16 @@ def train(rank, gpu, args):
             for p in netD.parameters():
                 p.requires_grad = False
             netG.zero_grad()
+            netEnc.zero_grad()
             
             
             t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
             
             
             x_t_D, x_tp1_D = q_sample_pairs(coeff, real_data, t, netTrg)
+            x_enc = netEnc(real_data, t)
             
-            latent_z = torch.randn(batch_size, nz,device=device)
+            latent_z = torch.randn(batch_size, nz,device=device) + x_enc
             
            
             x_t_D_predict = netG(x_tp1_D, t, latent_z)
@@ -455,14 +488,14 @@ def train(rank, gpu, args):
                 torchvision.utils.save_image(x_t_D_predict, os.path.join(exp_path, 'xpos_epoch_{}.png'.format(epoch)), normalize=True)
             
             x_t_1 = torch.randn_like(real_data)
-            fake_sample = sample_from_model(coeff, netG, (args.num_timesteps // args.step_size), x_t_1, T, args, netTrg)
+            fake_sample = sample_from_model(coeff, netG, (args.num_timesteps // args.step_size), x_t_1, T, args, netTrg, netEnc, real_data)
             torchvision.utils.save_image(fake_sample, os.path.join(exp_path, 'sample_discrete_epoch_{}.png'.format(epoch)), normalize=True)
             
             if args.save_content:
                 if epoch % args.save_content_every == 0:
                     print('Saving content.')
                     content = {'epoch': epoch + 1, 'global_step': global_step, 'args': args,
-                               'netG_dict': netG.state_dict(), 'optimizerG': optimizerG.state_dict(),
+                               'netG_dict': netG.state_dict(), 'netEnc_dict': netEnc.state_dict(), 'optimizerG': optimizerG.state_dict(),
                                'schedulerG': schedulerG.state_dict(), 'netD_dict': netD.state_dict(),
                                'optimizerD': optimizerD.state_dict(), 'schedulerD': schedulerD.state_dict()}
                     
@@ -473,6 +506,7 @@ def train(rank, gpu, args):
                     optimizerG.swap_parameters_with_ema(store_params_in_ema=True)
                     
                 torch.save(netG.state_dict(), os.path.join(exp_path, 'netG_{}.pth'.format(epoch)))
+                torch.save(netEnc.state_dict(), os.path.join(exp_path, 'netEnc_{}.pth'.format(epoch)))
                 if args.use_ema:
                     optimizerG.swap_parameters_with_ema(store_params_in_ema=True)
             

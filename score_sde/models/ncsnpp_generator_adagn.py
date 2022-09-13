@@ -41,6 +41,7 @@ import numpy as np
 ResnetBlockDDPM = layerspp.ResnetBlockDDPMpp_Adagn
 ResnetBlockBigGAN = layerspp.ResnetBlockBigGANpp_Adagn
 ResnetBlockBigGAN_one = layerspp.ResnetBlockBigGANpp_Adagn_one
+ResnetBlockBigGAN_modulate = layerspp.ResnetBlockBigGANpp_Adagn_modulate
 Combine = layerspp.Combine
 conv3x3 = layerspp.conv3x3
 conv1x1 = layerspp.conv1x1
@@ -159,6 +160,16 @@ class NCSNpp(nn.Module):
                                       zemb_dim = z_emb_dim)
     elif resblock_type == 'biggan_oneadagn':
       ResnetBlock = functools.partial(ResnetBlockBigGAN_one,
+                                      act=act,
+                                      dropout=dropout,
+                                      fir=fir,
+                                      fir_kernel=fir_kernel,
+                                      init_scale=init_scale,
+                                      skip_rescale=skip_rescale,
+                                      temb_dim=nf * 4,
+                                      zemb_dim = z_emb_dim)
+    elif resblock_type == 'biggan_modulate':
+      ResnetBlock = functools.partial(ResnetBlockBigGAN_modulate,
                                       act=act,
                                       dropout=dropout,
                                       fir=fir,

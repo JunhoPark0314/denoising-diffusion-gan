@@ -61,7 +61,8 @@ class SynthesisGroupConv2d(torch.nn.Module):
         self.act_clamp = act_clamp
         self.dyn_channel = w_dim
         self.init_scale = init_scale
-        self.init_weight_gen('random_dynami', kernel_size, in_channels, out_channels)
+        self.freq_dist = 'random_dynamic'
+        self.init_weight_gen('random_dynamic', kernel_size, in_channels, out_channels)
 
     def init_weight_gen(self, freq_dist, kernel_size, in_channels, out_channels):
         magnitude = torch.randn([in_channels, self.freq_dim])
@@ -108,7 +109,7 @@ class SynthesisGroupConv2d(torch.nn.Module):
         self.gain = float(np.sqrt(1 / (in_channels * (kernel_size ** 2))))
         self.freq_gain = float(np.sqrt(1 / (self.freq_dim * 2)))
 
-        self.bias = torch.nn.Parameter(torch.zeros([self.out_channels]))
+        self.bias = torch.nn.Parameter(torch.zeros([1,self.out_channels,1,1]))
 
     def get_basis(self):
         if self.freq_dist in ["random_train", "random_fixed", "random_dynamic"]:
@@ -126,7 +127,7 @@ class SynthesisGroupConv2d(torch.nn.Module):
         out_linear = self.out_linear
 
         if self.freq_dist == "random_dynamic":
-            s = self.affine(temb)
+            s = self.affine(temb).unsqueeze(1)
             # s = s * s.square().mean(dim=[1,2], keepdim=True).rsqrt()
             # magnitude = magnitude * magnitude.square().mean(dim=[1,2], keepdim=True).rsqrt()
             magnitude = torch.einsum('bkif,bik->bif', magnitude, s) / np.sqrt(self.num_freq)
@@ -138,18 +139,16 @@ class SynthesisGroupConv2d(torch.nn.Module):
 
         return kernel.squeeze(0)
 
-    def forward(self, x):
+    def forward(self, x, t_emb):
 
-        kernel = self.weight_gen(x).to(dtype=x.dtype)
-        batch_size = x.shape[0]
+        kernel = self.weight_gen(x, t_emb).to(dtype=x.dtype)
+        B, C, H, W = x.shape
         group_size = 1
         if self.freq_dist == "random_dynamic":
             kernel = kernel.reshape(-1, self.in_channels, self.kernel_size, self.kernel_size)
-            x = x.reshape(1, -1, *x.shape[2:])
-            group_size = batch_size
+            fx = x.reshape(1, -1, H, W)
+            group_size = B
+        else:
+            fx = x
 
-        x = torch.nn.functional.conv2d(x, kernel, padding=self.padding, groups=group_size)
-        x = x.reshape(batch_size, -1, *x.shape[2:])
-        if self.bias is not None:
-            x = torch.nn.SiLU()(x) + self.bias
-        return x
+        return torch.nn.functional.conv2d(fx, kernel, padding=self.padding, groups=group_size).reshape(B, -1, H, W) + self.bias

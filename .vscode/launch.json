@@ -13,7 +13,7 @@
 			"justMyCode": false,
 			"args": [
 				"--dataset", "cifar10",
-				"--exp", "ddgan_cifar10_exp1",
+				"--exp", "ddgan_cifar10_exp_debug",
 				"--num_channels", "3",
 				"--num_channels_dae", "32",
 				"--num_timesteps", "1000",
@@ -36,7 +36,7 @@
 				"--ch_mult", "1", "2", "2", "2",
 				"--save_content",
 				"--ddim", "ddim/configs/cifar10.yml",
-				"--resume"
+				// "--resume"
 			]
 		}
 	]

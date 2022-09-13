@@ -8,7 +8,7 @@ from score_sde.models.modulate_conv import SynthesisGroupConv2d
 import torch
 import torch.nn as nn
 import numpy as np
-from diffaug import DiffAugment
+from .diffaug import DiffAugment
 
 from . import up_or_down_sampling
 from . import dense_layer
@@ -100,7 +100,6 @@ class DownConvModulateBlock(nn.Module):
         self,
         in_channel,
         out_channel,
-        resolution,
         kernel_size=3,
         padding=1,
         t_emb_dim = 128,
@@ -114,16 +113,11 @@ class DownConvModulateBlock(nn.Module):
         self.fir_kernel = fir_kernel
         self.downsample = downsample
         
-        self.conv1 = nn.Sequential(
-                    SynthesisGroupConv2d(in_channel, out_channel, t_emb_dim, sampling_rate=8),
-                    # conv2d(in_channel, out_channel, kernel_size, padding=padding),
-                    )
+        self.conv1 = SynthesisGroupConv2d(in_channel, out_channel, t_emb_dim, sampling_rate=8)
 
         
-        self.conv2 = nn.Sequential(
-                    SynthesisGroupConv2d(in_channel, out_channel, t_emb_dim, sampling_rate=8, init_scale=0.),
-                    # conv2d(out_channel, out_channel, kernel_size, padding=padding,init_scale=0.)
-                    )
+        self.conv2 = SynthesisGroupConv2d(out_channel, out_channel, t_emb_dim, sampling_rate=8, init_scale=0.)
+
         self.dense_t1= dense(t_emb_dim, out_channel)
 
 
@@ -139,7 +133,7 @@ class DownConvModulateBlock(nn.Module):
     def forward(self, input, t_emb):
         
         out = self.act(input)
-        out = self.conv1(out)
+        out = self.conv1(out, t_emb)
         out += self.dense_t1(t_emb)[..., None, None]
        
         out = self.act(out)
@@ -147,7 +141,7 @@ class DownConvModulateBlock(nn.Module):
         if self.downsample:
             out = up_or_down_sampling.downsample_2d(out, self.fir_kernel, factor=2)
             input = up_or_down_sampling.downsample_2d(input, self.fir_kernel, factor=2)
-        out = self.conv2(out)
+        out = self.conv2(out, t_emb)
         
         
         skip = self.skip(input)
@@ -198,7 +192,7 @@ class Discriminator_small(nn.Module):
   def forward(self, x, t, x_t):
     t_embed = self.act(self.t_embed(t))  
     
-    x = DiffAugment(x, self.policy)
+    # x = DiffAugment(x, self.policy)
     input_x = torch.cat((x, x_t), dim = 1)
     
     h0 = self.start_conv(input_x)
@@ -270,7 +264,7 @@ class Discriminator_large(nn.Module):
   def forward(self, x, t, x_t):
     t_embed = self.act(self.t_embed(t))  
     
-    x = DiffAugment(x, self.policy)
+    # x = DiffAugment(x, self.policy)
     input_x = torch.cat((x, x_t), dim = 1)
     
     h = self.start_conv(input_x)
@@ -345,7 +339,7 @@ class Discriminator_small_modulate(nn.Module):
   def forward(self, x, t, x_t):
     t_embed = self.act(self.t_embed(t))  
     
-    x = DiffAugment(x, self.policy)
+    # x = DiffAugment(x, self.policy)
     input_x = torch.cat((x, x_t), dim = 1)
     
     h0 = self.start_conv(input_x)
