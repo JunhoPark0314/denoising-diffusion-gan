@@ -150,7 +150,7 @@ def q_sample(coeff, x_start, t, netTrg, *, noise=None):
     eps_trg = netTrg(x_t, t)
     x_0 = (x_t - (1 - a).sqrt() * eps_trg) / a.sqrt()
     
-    return x_0, a, x_t
+    return x_0, a, x_t, noise
 
 def q_sample_st(coeff, x_start, t, netTrg, a_next, noised_next, *, noise=None):
     """
@@ -171,7 +171,7 @@ def q_sample_st(coeff, x_start, t, netTrg, a_next, noised_next, *, noise=None):
     
     return x_0
 
-def q_sample_pairs(coeff, x_start, t, netTrg):
+def q_sample_pairs(coeff, x_start, t, netTrg, fix=False):
     """
     Generate a pair of disturbed images for training
     :param x_start: x_0
@@ -179,9 +179,9 @@ def q_sample_pairs(coeff, x_start, t, netTrg):
     :return: x_t, x_{t+1}
     """
     # noise = torch.randn_like(x_start)
-    x_t, a, x_noised = q_sample(coeff, x_start, t, netTrg)
+    x_t, a, x_noised, noise = q_sample(coeff, x_start, t, netTrg)
     prev_t = (t + coeff.step_size).clip(max=coeff.num_timesteps-1)
-    x_t_plus_one = q_sample_st(coeff, x_start, prev_t, netTrg, a, x_noised)
+    x_t_plus_one = q_sample_st(coeff, x_start, prev_t, netTrg, a, x_noised, noise=noise if fix else None)
     # x_t_plus_one = extract(coeff.a_s, prev_t, x_start.shape) * x_t + \
     #                extract(coeff.sigmas, prev_t, x_start.shape) * noise
     
@@ -451,7 +451,6 @@ def train(rank, gpu, args):
             netG.zero_grad()
             netEnc.zero_grad()
             
-            
             t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
             
             
@@ -470,6 +469,13 @@ def train(rank, gpu, args):
             errG = errG.mean()
             
             errG.backward()
+
+            if global_step % args.lazy_reg == 0:
+                x_t_D, x_tp1_D = q_sample_pairs(coeff, real_data, t, netTrg, fix=True)
+                x_enc = netEnc(real_data, t)
+                x_t_D_predict = netG(x_tp1_D, t, latent_z)
+                errRec = (x_t_D - x_tp1_D).square().mean()
+                errRec.backward()
 
             optimizerG.step()
             
