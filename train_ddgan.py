@@ -202,21 +202,27 @@ def sample_posterior(coeff, x_0, x_t, t, next_t, **kwargs):
 
 def sample_from_model(coeff, generator, n_time, x_init, T, opt, netTrg, netEnc, real_data):
     x = x_init
+    x0_list = []
     with torch.no_grad():
         t = torch.full((x.size(0),), 999, dtype=torch.int64).to(x.device)
-        x = netTrg(x, t)
-        for i in reversed(range(1, n_time)):
+        a = coeff.compute_alpha(t)
+        eps_pred = netTrg(x, t)
+        x = (x - (1 - a).sqrt() * eps_pred) / a.sqrt()
+        x0_list.append(x)
+
+        for i in reversed(range(0, n_time)):
             t = torch.full((x.size(0),), i * coeff.step_size, dtype=torch.int64).to(x.device)
-            x_enc = netEnc(real_data, t)
+            x_enc = netEnc(real_data, None)
           
             # t_time = t
             # next_time = (t - coeff.step_size).clip(min=0)
             latent_z = torch.randn(x.size(0), opt.nz, device=x.device) + x_enc
             x = generator(x, t, latent_z)
+            x0_list.append(x)
             # x_new = sample_posterior(coeff, x_0, x, t)
             # x = x_new.detach()
         
-    return x
+    return (torch.cat(x0_list) + 1) * 0.5
 
 def dict2namespace(config):
     namespace = argparse.Namespace()
@@ -305,7 +311,8 @@ def train(rank, gpu, args):
 
     enc_config = deepcopy(ddim_config)
     enc_config.model.out_ch = args.nz
-    enc_config.model.zero_out = True
+    enc_config.model.zero_out = False
+    enc_config.model.temb_ch = 0
     netEnc = Encoder(enc_config).to(device)
 
 
@@ -393,7 +400,7 @@ def train(rank, gpu, args):
             
             x_t_D, x_tp1_D = q_sample_pairs(coeff, real_data, t, netTrg)
             x_t_D.requires_grad = True
-            x_enc = netEnc(real_data, t)
+            x_enc = netEnc(real_data, None)
             
     
             # train with real
@@ -455,7 +462,7 @@ def train(rank, gpu, args):
             
             
             x_t_D, x_tp1_D = q_sample_pairs(coeff, real_data, t, netTrg)
-            x_enc = netEnc(real_data, t)
+            x_enc = netEnc(real_data, None)
             
             latent_z = torch.randn(batch_size, nz,device=device) + x_enc
             
@@ -470,12 +477,12 @@ def train(rank, gpu, args):
             
             errG.backward()
 
-            if global_step % args.lazy_reg == 0:
-                x_t_D, x_tp1_D = q_sample_pairs(coeff, real_data, t, netTrg, fix=True)
-                x_enc = netEnc(real_data, t)
-                x_t_D_predict = netG(x_tp1_D, t, latent_z)
-                errRec = (x_t_D - x_tp1_D).square().mean()
-                errRec.backward()
+            # t_fix = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
+            # x_t_D_fix, x_tp1_D_fix = q_sample_pairs(coeff, real_data, t_fix, netTrg, fix=True)
+            # x_enc_fix = netEnc(real_data, None)
+            # x_t_D_rec = netG(x_tp1_D_fix, t_fix, x_enc_fix)
+            # errRec = (x_t_D_rec - x_t_D_fix).square().mean() * 10
+            # errRec.backward()
 
             optimizerG.step()
             
@@ -483,6 +490,8 @@ def train(rank, gpu, args):
             if iteration % 100 == 0:
                 if rank == 0:
                     print('epoch {} iteration{}, G Loss: {}, D Loss: {}'.format(epoch,iteration, errG.item(), errD.item()))
+
+            break
         
         if not args.no_lr_decay:
             
@@ -490,12 +499,12 @@ def train(rank, gpu, args):
             schedulerD.step()
         
         if rank == 0:
-            if epoch % 10 == 0:
-                torchvision.utils.save_image(x_t_D_predict, os.path.join(exp_path, 'xpos_epoch_{}.png'.format(epoch)), normalize=True)
+            #if epoch % 10 == 0:
+            torchvision.utils.save_image((torch.cat([x_t_D_predict])+1)*0.5, os.path.join(exp_path, 'xpos_epoch_{}.png'.format(epoch)), normalize=False)
             
             x_t_1 = torch.randn_like(real_data)
             fake_sample = sample_from_model(coeff, netG, (args.num_timesteps // args.step_size), x_t_1, T, args, netTrg, netEnc, real_data)
-            torchvision.utils.save_image(fake_sample, os.path.join(exp_path, 'sample_discrete_epoch_{}.png'.format(epoch)), normalize=True)
+            torchvision.utils.save_image(fake_sample, os.path.join(exp_path, 'sample_discrete_epoch_{}.png'.format(epoch)), normalize=False)
             
             if args.save_content:
                 if epoch % args.save_content_every == 0:

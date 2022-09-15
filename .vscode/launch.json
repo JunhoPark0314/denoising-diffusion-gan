@@ -13,7 +13,7 @@
 			"justMyCode": false,
 			"args": [
 				"--dataset", "cifar10",
-				"--exp", "ddgan_cifar10_exp_debug",
+				"--exp", "ddgan_cifar10_exp_rec_new",
 				"--num_channels", "3",
 				"--num_channels_dae", "32",
 				"--num_timesteps", "1000",
@@ -23,7 +23,7 @@
 				"--ngf", "64",
 				"--nz", "100",
 				"--z_emb_dim", "64",
-				"--n_mlp", "4",
+				"--n_mlp", "5",
 				"--embedding_type", "positional",
 				"--use_ema", 
 				"--ema_decay", "0.9999",
@@ -36,7 +36,37 @@
 				"--ch_mult", "1", "2", "2", "2",
 				"--save_content",
 				"--ddim", "ddim/configs/cifar10.yml",
+				"--resume",
+				"--not_use_tanh",
+			]
+		},
+
+		{
+			"name": "Test",
+			"type": "python",
+			"request": "launch",
+			"program": "test_ddgan.py",
+			"console": "integratedTerminal",
+			"justMyCode": false,
+			"args": [
+				"--dataset", "cifar10",
+				"--exp", "ddgan_cifar10_exp_rec_new",
+				"--num_channels", "3",
+				"--num_channels_dae", "32",
+				"--num_timesteps", "1000",
+				"--num_res_blocks", "2",
+				"--batch_size", "64",
+				"--epoch_id", "1150",
+				"--nz", "100",
+				"--z_emb_dim", "64",
+				"--n_mlp", "5",
+				"--embedding_type", "positional",
+				// "--num_process_per_node", "1",
+				"--ch_mult", "1", "2", "2", "2",
+				"--ddim", "ddim/configs/cifar10.yml",
 				// "--resume"
+				"--compute_fid",
+				"--not_use_tanh",
 			]
 		}
 	]

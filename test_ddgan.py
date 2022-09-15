@@ -13,6 +13,48 @@ import os
 import torchvision
 from score_sde.models.ncsnpp_generator_adagn import NCSNpp
 from pytorch_fid.fid_score import calculate_fid_given_paths
+import torch.distributed as dist
+import shutil
+
+def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_timesteps):
+    def sigmoid(x):
+        return 1 / (np.exp(-x) + 1)
+
+    if beta_schedule == "quad":
+        betas = (
+            np.linspace(
+                beta_start ** 0.5,
+                beta_end ** 0.5,
+                num_diffusion_timesteps,
+                dtype=np.float64,
+            )
+            ** 2
+        )
+    elif beta_schedule == "linear":
+        betas = np.linspace(
+            beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64
+        )
+    elif beta_schedule == "const":
+        betas = beta_end * np.ones(num_diffusion_timesteps, dtype=np.float64)
+    elif beta_schedule == "jsd":  # 1/T, 1/(T-1), 1/(T-2), ..., 1
+        betas = 1.0 / np.linspace(
+            num_diffusion_timesteps, 1, num_diffusion_timesteps, dtype=np.float64
+        )
+    elif beta_schedule == "sigmoid":
+        betas = np.linspace(-6, 6, num_diffusion_timesteps)
+        betas = sigmoid(betas) * (beta_end - beta_start) + beta_start
+    else:
+        raise NotImplementedError(beta_schedule)
+    assert betas.shape == (num_diffusion_timesteps,)
+    return betas
+
+def copy_source(file, output_dir):
+    shutil.copyfile(file, os.path.join(output_dir, os.path.basename(file)))
+            
+def broadcast_params(params):
+    for param in params:
+        dist.broadcast(param.data, src=0)
+
 
 #%% Diffusion coefficients 
 def var_func_vp(t, beta_min, beta_max):
@@ -31,7 +73,7 @@ def extract(input, t, shape):
     return out
 
 def get_time_schedule(args, device):
-    n_timestep = args.num_timesteps
+    n_timestep = args.num_timesteps // args.step_size
     eps_small = 1e-3
     t = np.arange(0, n_timestep + 1, dtype=np.float64)
     t = t / n_timestep
@@ -62,69 +104,120 @@ def get_sigma_schedule(args, device):
     a_s = torch.sqrt(1-betas)
     return sigmas, a_s, betas
 
-#%% posterior sampling
-class Posterior_Coefficients():
-    def __init__(self, args, device):
-        
-        _, _, self.betas = get_sigma_schedule(args, device=device)
-        
-        #we don't need the zeros
-        self.betas = self.betas.type(torch.float32)[1:]
-        
-        self.alphas = 1 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, 0)
-        self.alphas_cumprod_prev = torch.cat(
-                                    (torch.tensor([1.], dtype=torch.float32,device=device), self.alphas_cumprod[:-1]), 0
-                                        )               
-        self.posterior_variance = self.betas * (1 - self.alphas_cumprod_prev) / (1 - self.alphas_cumprod)
-        
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_recip_alphas_cumprod = torch.rsqrt(self.alphas_cumprod)
-        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1 / self.alphas_cumprod - 1)
-        
-        self.posterior_mean_coef1 = (self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1 - self.alphas_cumprod))
-        self.posterior_mean_coef2 = ((1 - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1 - self.alphas_cumprod))
-        
-        self.posterior_log_variance_clipped = torch.log(self.posterior_variance.clamp(min=1e-20))
-        
-def sample_posterior(coefficients, x_0,x_t, t):
-    
-    def q_posterior(x_0, x_t, t):
-        mean = (
-            extract(coefficients.posterior_mean_coef1, t, x_t.shape) * x_0
-            + extract(coefficients.posterior_mean_coef2, t, x_t.shape) * x_t
+class Diffusion_Coefficients():
+    def __init__(self, args, config, device):
+                
+        betas = get_beta_schedule(
+            beta_schedule=config.diffusion.beta_schedule,
+            beta_start=config.diffusion.beta_start,
+            beta_end=config.diffusion.beta_end,
+            num_diffusion_timesteps=config.diffusion.num_diffusion_timesteps,
         )
-        var = extract(coefficients.posterior_variance, t, x_t.shape)
-        log_var_clipped = extract(coefficients.posterior_log_variance_clipped, t, x_t.shape)
-        return mean, var, log_var_clipped
+        betas = self.betas = torch.from_numpy(betas).float().to(device)
+        self.num_timesteps = args.num_timesteps
+        self.step_size = args.step_size
     
-  
-    def p_sample(x_0, x_t, t):
-        mean, _, log_var = q_posterior(x_0, x_t, t)
-        
-        noise = torch.randn_like(x_t)
-        
-        nonzero_mask = (1 - (t == 0).type(torch.float32))
-
-        return mean + nonzero_mask[:,None,None,None] * torch.exp(0.5 * log_var) * noise
-            
-    sample_x_pos = p_sample(x_0, x_t, t)
+    def compute_alpha(self, t):
+        beta = torch.cat([torch.zeros(1).to(self.betas.device), self.betas], dim=0)
+        a = (1 - beta).cumprod(dim=0).index_select(0, t+1).view(-1, 1, 1, 1)
+        return a
     
-    return sample_x_pos
+def q_sample(coeff, x_start, t, netTrg, *, noise=None):
+    """
+    Diffuse the data (t == 0 means diffused for t step)
+    """
+    if noise is None:
+      noise = torch.randn_like(x_start)
+    
+    a = coeff.compute_alpha(t)
+      
+    x_t = a.sqrt() * x_start + (1 - a).sqrt() * noise
+    eps_trg = netTrg(x_t, t)
+    x_0 = (x_t - (1 - a).sqrt() * eps_trg) / a.sqrt()
+    
+    return x_0, a, x_t, noise
 
-def sample_from_model(coefficients, generator, n_time, x_init, T, opt):
+def q_sample_st(coeff, x_start, t, netTrg, a_next, noised_next, *, noise=None):
+    """
+    Diffuse the data (t == 0 means diffused for t step)
+    """
+    if noise is None:
+      noise = torch.randn_like(x_start)
+    
+    a = coeff.compute_alpha(t)
+      
+    # x_t = a.sqrt() * x_start + (1 - a).sqrt() * noise
+    a_ts = (a / a_next)
+    var_ts = ((1-a) - (1-a_next) * a_ts)
+    x_t = a_ts.sqrt() * noised_next + var_ts.sqrt() * noise
+
+    eps_trg = netTrg(x_t, t)
+    x_0 = (x_t - (1 - a).sqrt() * eps_trg) / a.sqrt()
+    
+    return x_0
+
+def q_sample_pairs(coeff, x_start, t, netTrg, fix=False):
+    """
+    Generate a pair of disturbed images for training
+    :param x_start: x_0
+    :param t: time step t
+    :return: x_t, x_{t+1}
+    """
+    # noise = torch.randn_like(x_start)
+    x_t, a, x_noised, noise = q_sample(coeff, x_start, t, netTrg)
+    prev_t = (t + coeff.step_size).clip(max=coeff.num_timesteps-1)
+    x_t_plus_one = q_sample_st(coeff, x_start, prev_t, netTrg, a, x_noised, noise=noise if fix else None)
+    # x_t_plus_one = extract(coeff.a_s, prev_t, x_start.shape) * x_t + \
+    #                extract(coeff.sigmas, prev_t, x_start.shape) * noise
+    
+    return x_t.detach(), x_t_plus_one.detach()
+
+def sample_posterior(coeff, x_0, x_t, t, next_t, **kwargs):
+    at = coeff.compute_alpha(t)
+    at_next = coeff.compute_alpha(next_t)
+    et = (x_t - x_0 * at.sqrt()) / (1 - at).sqrt()
+
+    c1 = (
+        kwargs.get("eta", 0) * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt()
+    )
+    c2 = ((1 - at_next) - c1 ** 2).sqrt()
+    xt_next = at_next.sqrt() * x_0 + c1 * torch.randn_like(x_0) + c2 * et
+    
+    return xt_next
+
+def sample_from_model(coeff, generator, n_time, x_init, T, opt, netTrg, netEnc, real_data):
     x = x_init
+    x0_list = []
     with torch.no_grad():
-        for i in reversed(range(n_time)):
-            t = torch.full((x.size(0),), i, dtype=torch.int64).to(x.device)
-            
-            t_time = t
-            latent_z = torch.randn(x.size(0), opt.nz, device=x.device)#.to(x.device)
-            x_0 = generator(x, t_time, latent_z)
-            x_new = sample_posterior(coefficients, x_0, x, t)
-            x = x_new.detach()
+        t = torch.full((x.size(0),), 999, dtype=torch.int64).to(x.device)
+        a = coeff.compute_alpha(t)
+        eps_pred = netTrg(x, t)
+        x = (x - (1 - a).sqrt() * eps_pred) / a.sqrt()
+        x0_list.append(x)
+
+        for i in reversed(range(0, n_time)):
+            t = torch.full((x.size(0),), i * coeff.step_size, dtype=torch.int64).to(x.device)
+            x_enc = netEnc(real_data, None)
+          
+            # t_time = t
+            # next_time = (t - coeff.step_size).clip(min=0)
+            latent_z = torch.randn(x.size(0), opt.nz, device=x.device) + x_enc
+            x = generator(x, t, latent_z)
+            x0_list.append(x)
+            # x_new = sample_posterior(coeff, x_0, x, t)
+            # x = x_new.detach()
         
-    return x
+    return (torch.cat(x0_list) + 1) * 0.5
+
+def dict2namespace(config):
+    namespace = argparse.Namespace()
+    for key, value in config.items():
+        if isinstance(value, dict):
+            new_value = dict2namespace(value)
+        else:
+            new_value = value
+        setattr(namespace, key, new_value)
+    return namespace
 
 #%%
 def sample_and_test(args):
@@ -144,50 +237,88 @@ def sample_and_test(args):
 
     
     netG = NCSNpp(args).to(device)
-    ckpt = torch.load('./saved_info/dd_gan/{}/{}/netG_{}.pth'.format(args.dataset, args.exp, args.epoch_id), map_location=device)
+    g_ckpt = torch.load('./saved_info/dd_gan/{}/{}/netG_{}.pth'.format(args.dataset, args.exp, args.epoch_id), map_location=device)
+    enc_ckpt = torch.load('./saved_info/dd_gan/{}/{}/netEnc_{}.pth'.format(args.dataset, args.exp, args.epoch_id), map_location=device)
     
     #loading weights from ddp in single gpu
-    for key in list(ckpt.keys()):
-        ckpt[key[7:]] = ckpt.pop(key)
-    netG.load_state_dict(ckpt)
+    for key in list(g_ckpt.keys()):
+        g_ckpt[key[7:]] = g_ckpt.pop(key)
+    netG.load_state_dict(g_ckpt)
     netG.eval()
-    
-    
+
+    import yaml
+    from ddim.models.diffusion import Model as DDIM
+    from ddim.models.diffusion import Encoder
+    with open(args.ddim, "r") as f:
+        ddim_config = dict2namespace(yaml.safe_load(f))
+    netTrg = DDIM(ddim_config).to(device)
+    netTrg.load_state_dict(torch.load(ddim_config.model.pretrained))
+    coeff = Diffusion_Coefficients(args, ddim_config, device)
     T = get_time_schedule(args, device)
+
+    from copy import deepcopy
+
+    enc_config = deepcopy(ddim_config)
+    enc_config.model.out_ch = args.nz
+    enc_config.model.zero_out = False
+    enc_config.model.temb_ch = 0
+    netEnc = Encoder(enc_config).to(device)
+
+    for key in list(enc_ckpt.keys()):
+        enc_ckpt[key[7:]] = enc_ckpt.pop(key)
+    netEnc.load_state_dict(enc_ckpt)
+    netEnc.eval()
+
+
+    from torchvision.datasets import CIFAR10
+    import torchvision.transforms as transforms
+    dataset = CIFAR10('./data', train=True, transform=transforms.Compose([
+                    transforms.Resize(32),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))]), download=True)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset,
+                                                                    num_replicas=1,
+                                                                    rank=0)
+    data_loader = torch.utils.data.DataLoader(dataset,
+                                               batch_size=args.batch_size,
+                                               shuffle=False,
+                                               num_workers=4,
+                                               pin_memory=True,
+                                               sampler=train_sampler,
+                                               drop_last = False)
     
-    pos_coeff = Posterior_Coefficients(args, device)
+    data_iter = iter(data_loader)
         
     iters_needed = 50000 //args.batch_size
+    base_dir = 'saved_info/dd_gan/{}/{}'.format(args.dataset, args.exp)
     
-    save_dir = "./generated_samples/{}".format(args.dataset)
+    save_dir = f"{base_dir}/generated_samples"
     
     if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+        os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(f"{base_dir}/real_samples", exist_ok=True)
     
     if args.compute_fid:
         for i in range(iters_needed):
             with torch.no_grad():
+                real_data = next(data_iter)[0]
                 x_t_1 = torch.randn(args.batch_size, args.num_channels,args.image_size, args.image_size).to(device)
-                fake_sample = sample_from_model(pos_coeff, netG, args.num_timesteps, x_t_1,T,  args)
+                fake_sample = sample_from_model(coeff, netG, args.num_timesteps//args.step_size, x_t_1,T,  args, netTrg, netEnc, real_data.to(device)).cpu()
+                fake_sample = fake_sample[-len(real_data):]
                 
-                fake_sample = to_range_0_1(fake_sample)
+                # fake_sample = to_range_0_1(fake_sample)
                 for j, x in enumerate(fake_sample):
                     index = i * args.batch_size + j 
-                    torchvision.utils.save_image(x, './generated_samples/{}/{}.jpg'.format(args.dataset, index))
-                print('generating batch ', i)
+                    torchvision.utils.save_image(x, f'{base_dir}/generated_samples/{index}.jpg')
+                    torchvision.utils.save_image(to_range_0_1(real_data[j]), f'{base_dir}/real_samples/{index}.jpg')
+                print('generating batch ', i, iters_needed)
         
         paths = [save_dir, real_img_dir]
     
         kwargs = {'batch_size': 100, 'device': device, 'dims': 2048}
         fid = calculate_fid_given_paths(paths=paths, **kwargs)
         print('FID = {}'.format(fid))
-    else:
-        x_t_1 = torch.randn(args.batch_size, args.num_channels,args.image_size, args.image_size).to(device)
-        fake_sample = sample_from_model(pos_coeff, netG, args.num_timesteps, x_t_1,T,  args)
-        fake_sample = to_range_0_1(fake_sample)
-        torchvision.utils.save_image(fake_sample, './samples_{}.jpg'.format(args.dataset))
-
-    
     
             
 
@@ -256,13 +387,15 @@ if __name__ == '__main__':
                             help='size of image')
 
     parser.add_argument('--nz', type=int, default=100)
-    parser.add_argument('--num_timesteps', type=int, default=4)
-    
     
     parser.add_argument('--z_emb_dim', type=int, default=256)
     parser.add_argument('--t_emb_dim', type=int, default=256)
     parser.add_argument('--batch_size', type=int, default=200, help='sample generating batch size')
         
+    parser.add_argument('--ddim', type=str, default=None,
+                        help='Target ddim model config')
+    parser.add_argument('--num_timesteps', type=int, default=1000)
+    parser.add_argument('--step_size', type=int, default=166)
 
 
 
